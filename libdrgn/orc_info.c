@@ -3,6 +3,8 @@
 
 #include <byteswap.h>
 #include <gelf.h>
+#include <limits.h>
+#include <stdalign.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,6 +13,7 @@
 #include "error.h"
 #include "orc.h"
 #include "platform.h"
+#include "program.h"
 #include "util.h"
 
 void drgn_module_orc_info_deinit(struct drgn_module *module)
@@ -19,27 +22,41 @@ void drgn_module_orc_info_deinit(struct drgn_module *module)
 	free(module->orc.pc_offsets);
 }
 
-/*
- * Get the program counter of an ORC entry directly from the .orc_unwind_ip
- * section.
- */
-static inline uint64_t drgn_raw_orc_pc(struct drgn_module *module, size_t i)
+// Getters for "raw" ORC information, i.e., before it is byte swapped or
+// normalized to the latest version.
+static inline uint64_t drgn_raw_orc_pc(struct drgn_module *module,
+				       unsigned int i)
 {
-	int32_t offset;
-	memcpy(&offset,
-	       (int32_t *)module->debug_file->scn_data[DRGN_SCN_ORC_UNWIND_IP]->d_buf + i,
-	       sizeof(offset));
+	int32_t offset = module->orc.pc_offsets[i];
 	if (drgn_elf_file_bswap(module->debug_file))
 		offset = bswap_32(offset);
 	return module->orc.pc_base + UINT64_C(4) * i + offset;
+}
+
+static bool
+drgn_raw_orc_entry_is_terminator(struct drgn_module *module, unsigned int i)
+{
+	uint16_t flags = module->orc.entries[i].flags;
+	if (drgn_elf_file_bswap(module->debug_file))
+		flags = bswap_16(flags);
+	if (module->orc.version >= 3) {
+		// orc->type == ORC_TYPE_UNDEFINED
+		return (flags & 0x700) == 0;
+	} else if (module->orc.version == 2) {
+		// orc->sp_reg == ORC_REG_UNDEFINED && !orc->end
+		return (flags & 0x80f) == 0;
+	} else {
+		// orc->sp_reg == ORC_REG_UNDEFINED && !orc->end
+		return (flags & 0x40f) == 0;
+	}
 }
 
 static _Thread_local struct drgn_module *compare_orc_entries_module;
 static int compare_orc_entries(const void *a, const void *b)
 {
 	struct drgn_module *module = compare_orc_entries_module;
-	size_t index_a = *(size_t *)a;
-	size_t index_b = *(size_t *)b;
+	unsigned int index_a = *(unsigned int *)a;
+	unsigned int index_b = *(unsigned int *)b;
 
 	uint64_t pc_a = drgn_raw_orc_pc(module, index_a);
 	uint64_t pc_b = drgn_raw_orc_pc(module, index_b);
@@ -52,25 +69,16 @@ static int compare_orc_entries(const void *a, const void *b)
 	 * If two entries have the same PC, then one is probably a "terminator"
 	 * at the end of a compilation unit. Prefer the real entry.
 	 */
-	const struct drgn_orc_entry *entries =
-		module->debug_file->scn_data[DRGN_SCN_ORC_UNWIND]->d_buf;
-	uint16_t flags_a, flags_b;
-	memcpy(&flags_a, &entries[index_a].flags, sizeof(flags_a));
-	memcpy(&flags_b, &entries[index_b].flags, sizeof(flags_b));
-	if (drgn_elf_file_bswap(module->debug_file)) {
-		flags_a = bswap_16(flags_a);
-		flags_b = bswap_16(flags_b);
-	}
-	return (drgn_orc_flags_is_terminator(flags_b)
-		- drgn_orc_flags_is_terminator(flags_a));
+	return (drgn_raw_orc_entry_is_terminator(module, index_b)
+		- drgn_raw_orc_entry_is_terminator(module, index_a));
 }
 
-static size_t keep_orc_entry(struct drgn_module *module, size_t *indices,
-			     size_t num_entries, size_t i)
+static unsigned int keep_orc_entry(struct drgn_module *module,
+				   unsigned int *indices,
+				   unsigned int num_entries, unsigned int i)
 {
 
-	const struct drgn_orc_entry *entries =
-		module->debug_file->scn_data[DRGN_SCN_ORC_UNWIND]->d_buf;
+	const struct drgn_orc_entry *entries = module->orc.entries;
 	if (num_entries > 0 &&
 	    memcmp(&entries[indices[num_entries - 1]], &entries[indices[i]],
 		   sizeof(entries[0])) == 0) {
@@ -93,8 +101,9 @@ static size_t keep_orc_entry(struct drgn_module *module, size_t *indices,
  * Note that we don't bother checking EH CFI because currently ORC is only used
  * for the Linux kernel on x86-64, which explicitly disables EH data.
  */
-static size_t remove_fdes_from_orc(struct drgn_module *module, size_t *indices,
-				   size_t num_entries)
+static unsigned int remove_fdes_from_orc(struct drgn_module *module,
+					 unsigned int *indices,
+					 unsigned int num_entries)
 {
 	if (module->dwarf.debug_frame.num_fdes == 0)
 		return num_entries;
@@ -103,7 +112,7 @@ static size_t remove_fdes_from_orc(struct drgn_module *module, size_t *indices,
 	struct drgn_dwarf_fde *last_fde =
 		fde + module->dwarf.debug_frame.num_fdes - 1;
 
-	size_t new_num_entries = 0;
+	unsigned int new_num_entries = 0;
 
 	/* Keep any entries that start before the first DWARF FDE. */
 	uint64_t start_pc;
@@ -116,7 +125,7 @@ static size_t remove_fdes_from_orc(struct drgn_module *module, size_t *indices,
 			return num_entries;
 	}
 
-	for (size_t i = new_num_entries; i < num_entries - 1; i++) {
+	for (unsigned int i = new_num_entries; i < num_entries - 1; i++) {
 		uint64_t end_pc = drgn_raw_orc_pc(module, i + 1);
 
 		/*
@@ -170,49 +179,122 @@ static size_t remove_fdes_from_orc(struct drgn_module *module, size_t *indices,
 			      num_entries - 1);
 }
 
+// Currently, we have to check the kernel version to determine the ORC version.
+// This will hopefully be fixed by Linux kernel patch "x86/unwind/orc: add ELF
+// section with ORC version identifier":
+// https://lore.kernel.org/linux-debuggers/aef9c8dc43915b886a8c48509a12ec1b006ca1ca.1686690801.git.osandov@osandov.com/.
+static int orc_version_from_osrelease(struct drgn_program *prog)
+{
+	char *p = (char *)prog->vmcoreinfo.osrelease;
+	long major = strtol(p, &p, 10);
+	long minor = 0;
+	if (*p == '.')
+		minor = strtol(p + 1, NULL, 10);
+	if (major > 6 || (major == 6 && minor >= 4))
+		return 3;
+	else if (major == 6 && minor == 3)
+		return 2;
+	else
+		return 1;
+}
+
+static struct drgn_error *drgn_read_orc_sections(struct drgn_module *module)
+{
+	struct drgn_error *err;
+	Elf *elf = module->debug_file->elf;
+
+	size_t shstrndx;
+	if (elf_getshdrstrndx(elf, &shstrndx))
+		return drgn_error_libelf();
+
+	Elf_Scn *orc_unwind_ip_scn = NULL;
+	Elf_Scn *orc_unwind_scn = NULL;
+
+	Elf_Scn *scn = NULL;
+	while ((scn = elf_nextscn(elf, scn))) {
+		GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn, &shdr_mem);
+		if (!shdr)
+			return drgn_error_libelf();
+
+		if (shdr->sh_type != SHT_PROGBITS)
+			continue;
+
+		const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
+		if (!scnname)
+			return drgn_error_libelf();
+
+		if (!orc_unwind_ip_scn
+		    && strcmp(scnname, ".orc_unwind_ip") == 0) {
+			orc_unwind_ip_scn = scn;
+			module->orc.pc_base = shdr->sh_addr;
+		} else if (!orc_unwind_scn
+			   && strcmp(scnname, ".orc_unwind") == 0) {
+			orc_unwind_scn = scn;
+		}
+	}
+
+	if (!orc_unwind_ip_scn || !orc_unwind_scn) {
+		module->orc.num_entries = 0;
+		return NULL;
+	}
+
+	module->orc.version = orc_version_from_osrelease(module->prog);
+
+	Elf_Data *orc_unwind_ip, *orc_unwind;
+	err = read_elf_section(orc_unwind_ip_scn, &orc_unwind_ip);
+	if (err)
+		return err;
+	err = read_elf_section(orc_unwind_scn, &orc_unwind);
+	if (err)
+		return err;
+
+	size_t num_entries = orc_unwind_ip->d_size / sizeof(int32_t);
+	if (num_entries > UINT_MAX) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 ".orc_unwind_ip is too large");
+	}
+	module->orc.num_entries = num_entries;
+
+	if (orc_unwind_ip->d_size % sizeof(int32_t) != 0 ||
+	    orc_unwind->d_size % sizeof(struct drgn_orc_entry) != 0 ||
+	    orc_unwind->d_size / sizeof(struct drgn_orc_entry)
+	    != module->orc.num_entries) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 ".orc_unwind_ip and/or .orc_unwind has invalid size");
+	}
+	if ((uintptr_t)orc_unwind_ip->d_buf % alignof(int32_t)) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 ".orc_unwind_ip is not sufficiently aligned");
+	}
+	if ((uintptr_t)orc_unwind->d_buf % alignof(struct drgn_orc_entry)) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 ".orc_unwind is not sufficiently aligned");
+	}
+
+	module->orc.pc_offsets = orc_unwind_ip->d_buf;
+	module->orc.entries = orc_unwind->d_buf;
+
+	return NULL;
+}
+
 static struct drgn_error *drgn_debug_info_parse_orc(struct drgn_module *module)
 {
 	struct drgn_error *err;
 
-	if (!module->debug_file->platform.arch->orc_to_cfi ||
-	    !module->debug_file->scns[DRGN_SCN_ORC_UNWIND_IP] ||
-	    !module->debug_file->scns[DRGN_SCN_ORC_UNWIND])
+	if (!module->debug_file->platform.arch->orc_to_cfi)
 		return NULL;
 
-	GElf_Shdr shdr_mem, *shdr;
-	shdr = gelf_getshdr(module->debug_file->scns[DRGN_SCN_ORC_UNWIND_IP],
-			    &shdr_mem);
-	if (!shdr)
-		return drgn_error_libelf();
-	module->orc.pc_base = shdr->sh_addr;
+	err = drgn_read_orc_sections(module);
+	if (err || !module->orc.num_entries)
+		goto out_clear;
 
-	err = drgn_elf_file_cache_section(module->debug_file,
-					  DRGN_SCN_ORC_UNWIND_IP);
-	if (err)
-		return err;
-	err = drgn_elf_file_cache_section(module->debug_file,
-					  DRGN_SCN_ORC_UNWIND);
-	if (err)
-		return err;
-	Elf_Data *orc_unwind_ip =
-		module->debug_file->scn_data[DRGN_SCN_ORC_UNWIND_IP];
-	Elf_Data *orc_unwind =
-		module->debug_file->scn_data[DRGN_SCN_ORC_UNWIND];
-
-	size_t num_entries = orc_unwind_ip->d_size / sizeof(int32_t);
-	if (orc_unwind_ip->d_size % sizeof(int32_t) != 0 ||
-	    orc_unwind->d_size % sizeof(struct drgn_orc_entry) != 0 ||
-	    orc_unwind->d_size / sizeof(struct drgn_orc_entry) != num_entries) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
-					 ".orc_unwind_ip and/or .orc_unwind has invalid size");
+	unsigned int num_entries = module->orc.num_entries;
+	unsigned int *indices = malloc_array(num_entries, sizeof(indices[0]));
+	if (!indices) {
+		err = &drgn_enomem;
+		goto out_clear;
 	}
-	if (!num_entries)
-		return NULL;
-
-	size_t *indices = malloc_array(num_entries, sizeof(indices[0]));
-	if (!indices)
-		return &drgn_enomem;
-	for (size_t i = 0; i < num_entries; i++)
+	for (unsigned int i = 0; i < num_entries; i++)
 		indices[i] = i;
 
 	compare_orc_entries_module = module;
@@ -222,7 +304,7 @@ static struct drgn_error *drgn_debug_info_parse_orc(struct drgn_module *module)
 	 * sorting") (in v5.6), this is already sorted for vmlinux, so only sort
 	 * it if necessary.
 	 */
-	for (size_t i = 1; i < num_entries; i++) {
+	for (unsigned int i = 1; i < num_entries; i++) {
 		if (compare_orc_entries(&indices[i - 1], &indices[i]) > 0) {
 			qsort(indices, num_entries, sizeof(indices[0]),
 			      compare_orc_entries);
@@ -244,23 +326,56 @@ static struct drgn_error *drgn_debug_info_parse_orc(struct drgn_module *module)
 		err = &drgn_enomem;
 		goto out;
 	}
-	const int32_t *orig_offsets = orc_unwind_ip->d_buf;
-	const struct drgn_orc_entry *orig_entries = orc_unwind->d_buf;
-	bool bswap = drgn_elf_file_bswap(module->debug_file);
-	for (size_t i = 0; i < num_entries; i++) {
-		size_t index = indices[i];
-		int32_t offset;
-		memcpy(&offset, &orig_offsets[index], sizeof(offset));
-		struct drgn_orc_entry entry;
-		memcpy(&entry, &orig_entries[index], sizeof(entry));
+	const int32_t *orig_offsets = module->orc.pc_offsets;
+	const struct drgn_orc_entry *orig_entries = module->orc.entries;
+	const bool bswap = drgn_elf_file_bswap(module->debug_file);
+	const int version = module->orc.version;
+	for (unsigned int i = 0; i < num_entries; i++) {
+		unsigned int index = indices[i];
+		int32_t offset = orig_offsets[index];
+		entries[i] = orig_entries[index];
 		if (bswap) {
 			offset = bswap_32(offset);
-			entry.sp_offset = bswap_16(entry.sp_offset);
-			entry.bp_offset = bswap_16(entry.bp_offset);
-			entry.flags = bswap_16(entry.flags);
+			entries[i].sp_offset = bswap_16(entries[i].sp_offset);
+			entries[i].bp_offset = bswap_16(entries[i].bp_offset);
+			entries[i].flags = bswap_16(entries[i].flags);
+		}
+		// "Upgrade" the format to version 3. See struct
+		// drgn_orc_type::flags.
+		if (version == 2) {
+			// There are no UNDEFINED or END_OF_STACK types in
+			// versions 1 and 2. Instead, sp_reg ==
+			// ORC_REG_UNDEFINED && !end is equivalent to UNDEFINED,
+			// and sp_reg == ORC_REG_UNDEFINED && end is equivalent
+			// to END_OF_STACK.
+			int type;
+			if ((entries[i].flags & 0x80f) == 0)
+				type = DRGN_ORC_TYPE_UNDEFINED << 8;
+			else if ((entries[i].flags & 0x80f) == 0x800)
+				type = DRGN_ORC_TYPE_END_OF_STACK << 8;
+			else
+				type = (entries[i].flags & 0x300) + 0x200;
+			int signal = (entries[i].flags & 0x400) << 1;
+			entries[i].flags = ((entries[i].flags & 0xff)
+					    | type
+					    | signal);
+		} else if (version == 1) {
+			int type;
+			if ((entries[i].flags & 0x40f) == 0)
+				type = DRGN_ORC_TYPE_UNDEFINED << 8;
+			else if ((entries[i].flags & 0x40f) == 0x400)
+				type = DRGN_ORC_TYPE_END_OF_STACK << 8;
+			else
+				type = (entries[i].flags & 0x300) + 0x200;
+			// There is no signal flag in version 1. Instead,
+			// ORC_TYPE_REGS and ORC_TYPE_REGS_PARTIAL imply the
+			// signal flag, and ORC_TYPE_CALL does not.
+			int signal = (entries[i].flags & 0x300) > 0 ? 0x800 : 0;
+			entries[i].flags = ((entries[i].flags & 0xff)
+					    | type
+					    | signal);
 		}
 		pc_offsets[i] = UINT64_C(4) * index + offset - UINT64_C(4) * i;
-		entries[i] = entry;
 	}
 
 	module->orc.pc_offsets = pc_offsets;
@@ -270,10 +385,15 @@ static struct drgn_error *drgn_debug_info_parse_orc(struct drgn_module *module)
 	err = NULL;
 out:
 	free(indices);
+	if (err) {
+out_clear:
+		module->orc.pc_offsets = NULL;
+		module->orc.entries = NULL;
+	}
 	return err;
 }
 
-static inline uint64_t drgn_orc_pc(struct drgn_module *module, size_t i)
+static inline uint64_t drgn_orc_pc(struct drgn_module *module, unsigned int i)
 {
 	return module->orc.pc_base + UINT64_C(4) * i + module->orc.pc_offsets[i];
 }
@@ -300,9 +420,9 @@ drgn_module_find_orc_cfi(struct drgn_module *module, uint64_t pc,
 	 */
 	if (!module->orc.num_entries || unbiased_pc < drgn_orc_pc(module, 0))
 		return &drgn_not_found;
-	size_t lo = 0, hi = module->orc.num_entries, found = 0;
+	unsigned int lo = 0, hi = module->orc.num_entries, found = 0;
 	while (lo < hi) {
-		size_t mid = lo + (hi - lo) / 2;
+		unsigned int mid = lo + (hi - lo) / 2;
 		if (drgn_orc_pc(module, mid) <= unbiased_pc) {
 			found = mid;
 			lo = mid + 1;
